@@ -10,7 +10,7 @@
 - 修复了 ConvLSTM 时间维处理和固定 `30x30` 输入假设等实现问题
 - 提供预处理、训练、评估、可视化的完整脚本
 
-## 我做了哪些核心工作
+## 核心工作
 
 ### 1. 数据适配
 
@@ -107,7 +107,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\evaluate_nasa_release.ps1
 - adjusted recall: `0.7201`
 - adjusted F1: `0.5828`
 
-这个结果说明项目已经完整跑通了 NASA 数据适配、训练和评估流程，后续仍有优化空间。
+项目已经完整跑通了 NASA 数据适配、训练和评估流程，后续仍有优化空间。
 
 ## 项目结构
 
