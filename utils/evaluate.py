@@ -1,117 +1,153 @@
-import numpy as np
+from __future__ import annotations
+
 import argparse
-import matplotlib.pyplot as plt
-import string
-import re
-import math
-import os
+import sys
+from pathlib import Path
+
 import torch
 
-parser = argparse.ArgumentParser(description = 'MSCRED evaluation')
-parser.add_argument('--thred_broken', type = int, default = 0.005,
-				   help = 'broken pixel thred')
-parser.add_argument('--alpha', type = int, default = 1.5,
-				   help = 'scale coefficient of max valid anomaly')
-parser.add_argument('--valid_start_point',  type = int, default = 8000,
-						help = 'test start point')
-parser.add_argument('--valid_end_point',  type = int, default = 10000,
-						help = 'test end point')
-parser.add_argument('--test_start_point',  type = int, default = 10000,
-						help = 'test start point')
-parser.add_argument('--test_end_point',  type = int, default = 20000,
-						help = 'test end point')
-parser.add_argument('--gap_time', type = int, default = 10,
-				   help = 'gap time between each segment')
-parser.add_argument('--matrix_data_path', type = str, default = './data/matrix_data/',
-				   help='matrix data path')
+if __package__ is None or __package__ == "":
+    sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-args = parser.parse_args()
-print(args)
+from model.mscred import MSCRED
+from utils.data import build_dataloaders
+from utils.nasa import ensure_dir, parse_int_sequence, prepare_nasa_cache
+from utils.pipeline import (
+    apply_thresholds,
+    collect_scores,
+    compute_thresholds,
+    save_channel_plots,
+    save_metrics,
+    summarize_metrics,
+)
 
-thred_b = args.thred_broken
-alpha = args.alpha
-gap_time = args.gap_time
-valid_start = args.valid_start_point//gap_time
-valid_end = args.valid_end_point//gap_time
-test_start = args.test_start_point//gap_time
-test_end = args.test_end_point//gap_time
 
-valid_anomaly_score = np.zeros((valid_end - valid_start , 1))
-test_anomaly_score = np.zeros((test_end - test_start, 1))
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Evaluate a trained NASA-adapted MSCRED checkpoint.")
+    parser.add_argument("--checkpoint-path", type=str, default="./checkpoints/release/nasa_mscred_best.pth")
+    parser.add_argument("--raw-data-dir", type=str, default=None)
+    parser.add_argument("--labels-path", type=str, default=None)
+    parser.add_argument("--processed-dir", type=str, default=None)
+    parser.add_argument("--rebuild-cache", action="store_true")
+    parser.add_argument("--recompute-thresholds", action="store_true")
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--num-workers", type=int, default=None)
+    parser.add_argument("--score-topk-ratio", type=float, default=None)
+    parser.add_argument("--threshold-quantile", type=float, default=None)
+    parser.add_argument("--threshold-std-factor", type=float, default=None)
+    parser.add_argument("--smooth-window", type=int, default=None)
+    parser.add_argument("--metrics-path", type=str, default="./outputs/release/eval_metrics.json")
+    parser.add_argument("--scores-path", type=str, default="./outputs/release/eval_scores.csv")
+    parser.add_argument("--plots-dir", type=str, default="./outputs/release/eval_plots")
+    parser.add_argument("--max-plots", type=int, default=12)
+    return parser
 
-matrix_data_path = args.matrix_data_path
-test_data_path = matrix_data_path + "test_data/"
-reconstructed_data_path = matrix_data_path + "reconstructed_data/"
-#reconstructed_data_path = matrix_data_path + "matrix_pred_data/"
-criterion = torch.nn.MSELoss()
 
-for i in range(valid_start, test_end):
-	path_temp_1 = os.path.join(test_data_path, "test_data_" + str(i) + '.npy')
-	gt_matrix_temp = np.load(path_temp_1)
+def main() -> None:
+    args = build_parser().parse_args()
+    checkpoint = torch.load(args.checkpoint_path, map_location="cpu")
+    checkpoint_config = checkpoint.get("config", {})
 
-	path_temp_2 = os.path.join(reconstructed_data_path, "reconstructed_data_" + str(i) + '.npy')
-	#path_temp_2 = os.path.join(reconstructed_data_path, "pcc_matrix_full_test_" + str(i) + '_pred_output.npy')
-	reconstructed_matrix_temp = np.load(path_temp_2)
-	# reconstructed_matrix_temp = np.transpose(reconstructed_matrix_temp, [0, 3, 1, 2])
-	#print(reconstructed_matrix_temp.shape)
-	#first (short) duration scale for evaluation  
-	select_gt_matrix = np.array(gt_matrix_temp)[-1][0] #get last step matrix
+    raw_data_dir = args.raw_data_dir or checkpoint_config.get("raw_data_dir", "./archive/data/data")
+    labels_path = args.labels_path or checkpoint_config.get("labels_path", "./archive/labeled_anomalies.csv")
+    processed_dir = args.processed_dir or checkpoint_config.get("processed_dir", "./data/nasa_processed")
+    windows = parse_int_sequence(checkpoint_config.get("windows", "10,30,60"))
+    history_steps = int(checkpoint_config.get("history_steps", 5))
+    stride = int(checkpoint_config.get("stride", 5))
+    validation_ratio = float(checkpoint_config.get("validation_ratio", 0.15))
+    min_validation_samples = int(checkpoint_config.get("min_validation_samples", 8))
+    batch_size = int(args.batch_size or checkpoint_config.get("batch_size", 16))
+    num_workers = int(args.num_workers or checkpoint_config.get("num_workers", 0))
+    smooth_window = int(args.smooth_window or checkpoint_config.get("smooth_window", 1))
+    score_topk_ratio = float(args.score_topk_ratio or checkpoint_config.get("score_topk_ratio", 0.02))
+    threshold_quantile = float(args.threshold_quantile or checkpoint_config.get("threshold_quantile", 0.98))
+    threshold_std_factor = float(args.threshold_std_factor or checkpoint_config.get("threshold_std_factor", 1.5))
+    balance_channels = bool(checkpoint_config.get("balance_channels", False))
 
-	select_reconstructed_matrix = np.array(reconstructed_matrix_temp)[0][0]
+    ensure_dir(Path(args.metrics_path).parent)
+    ensure_dir(Path(args.scores_path).parent)
 
-	#compute number of broken element in residual matrix
-	select_matrix_error = np.square(np.subtract(select_gt_matrix, select_reconstructed_matrix))
-	num_broken = len(select_matrix_error[select_matrix_error > thred_b])
+    manifest_path = Path(processed_dir) / "manifest.json"
+    if args.rebuild_cache or not manifest_path.exists():
+        prepare_nasa_cache(
+            raw_data_dir=raw_data_dir,
+            labels_path=labels_path,
+            output_dir=processed_dir,
+            spacecraft=checkpoint_config.get("spacecraft", "all"),
+            channel_id=checkpoint_config.get("channel_id"),
+            channel_limit=checkpoint_config.get("channel_limit"),
+            overwrite=args.rebuild_cache,
+        )
 
-	#print num_broken
-	if i < valid_end:
-		valid_anomaly_score[i - valid_start] = num_broken
-	else:
-		test_anomaly_score[i - test_start] = num_broken
-valid_anomaly_max = np.max(valid_anomaly_score.ravel())
-test_anomaly_score = test_anomaly_score.ravel()
-#print(test_anomaly_score)
-# plot anomaly score curve and identification result
-anomaly_pos = np.zeros(5)
-root_cause_gt = np.zeros((5, 3))
-anomaly_span = [10, 30, 90]
-root_cause_f = open("./data/test_anomaly.csv", "r")
-row_index = 0
-for line in root_cause_f:
-	line=line.strip()
-	anomaly_axis = int(re.split(',',line)[0])
-	anomaly_pos[row_index] = anomaly_axis/gap_time - test_start - anomaly_span[row_index%3]/gap_time
-	#print(anomaly_pos[row_index])
-	root_list = re.split(',',line)[1:]
-	for k in range(len(root_list)-1):
-		root_cause_gt[row_index][k] = int(root_list[k])
-	row_index += 1
-root_cause_f.close()
+    dataloaders, metadata = build_dataloaders(
+        processed_dir=processed_dir,
+        batch_size=batch_size,
+        windows=windows,
+        history_steps=history_steps,
+        stride=stride,
+        validation_ratio=validation_ratio,
+        min_validation_samples=min_validation_samples,
+        num_workers=num_workers,
+        balance_channels=balance_channels,
+    )
 
-fig, axes = plt.subplots()
-#plt.plot(test_anomaly_score, 'black', linewidth = 2)
-test_num = test_end - test_start
-# plt.xticks(fontsize = 25)
-# plt.ylim((0, 100))
-# plt.yticks(np.arange(0, 101, 20), fontsize = 25)
-plt.plot(test_anomaly_score, color = 'black', linewidth = 2)
-threshold = np.full((test_num), valid_anomaly_max * alpha)
-axes.plot(threshold, color = 'black', linestyle = '--',linewidth = 2)
-for k in range(len(anomaly_pos)):
-	axes.axvspan(anomaly_pos[k], anomaly_pos[k] + anomaly_span[k%3]/gap_time, color='red', linewidth=2)
-labels = [' ', '0e3', '2e3', '4e3', '6e3', '8e3', '10e3']
-# axes.set_xticklabels(labels, rotation = 25, fontsize = 20)
-plt.xlabel('Test Time', fontsize = 25)
-plt.ylabel('Anomaly Score', fontsize = 25)
-axes.spines['right'].set_visible(False)
-axes.spines['top'].set_visible(False)
-axes.yaxis.set_ticks_position('left')
-axes.xaxis.set_ticks_position('bottom')
-fig.subplots_adjust(bottom=0.25)
-fig.subplots_adjust(left=0.25)
-plt.title("MSCRED", size = 25)
-plt.savefig('./outputs/anomaly_score.jpg')
-plt.show()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = MSCRED(input_channels=len(windows)).to(device)
+    model.load_state_dict(checkpoint["model_state"])
+
+    if args.recompute_thresholds or "thresholds" not in checkpoint:
+        val_scores, val_loss = collect_scores(
+            model=model,
+            dataloader=dataloaders["val"],
+            device=device,
+            topk_ratio=score_topk_ratio,
+        )
+        thresholds = compute_thresholds(
+            validation_scores=val_scores,
+            quantile=threshold_quantile,
+            std_factor=threshold_std_factor,
+        )
+    else:
+        val_scores, val_loss = collect_scores(
+            model=model,
+            dataloader=dataloaders["val"],
+            device=device,
+            topk_ratio=score_topk_ratio,
+        )
+        thresholds = checkpoint["thresholds"]
+
+    test_scores, test_loss = collect_scores(
+        model=model,
+        dataloader=dataloaders["test"],
+        device=device,
+        topk_ratio=score_topk_ratio,
+    )
+    scored_test = apply_thresholds(
+        scores=test_scores,
+        thresholds=thresholds,
+        smooth_window=smooth_window,
+    )
+    metrics = summarize_metrics(scored_test)
+    metrics["losses"] = {"validation": val_loss, "test": test_loss}
+    metrics["dataset"] = {
+        "windows": list(windows),
+        "history_steps": history_steps,
+        "stride": stride,
+        "dataset_sizes": metadata["dataset_sizes"],
+    }
+
+    save_metrics(metrics, args.metrics_path)
+    scored_test.to_csv(args.scores_path, index=False)
+    save_channel_plots(scored_test, args.plots_dir, max_channels=args.max_plots)
+    print(
+        "Evaluation complete: "
+        f"raw_f1={metrics['global'].get('f1', float('nan')):.4f}, "
+        f"adjusted_f1={metrics['global_adjusted'].get('f1', float('nan')):.4f}"
+    )
+
+
+if __name__ == "__main__":
+    main()
 
 
 
