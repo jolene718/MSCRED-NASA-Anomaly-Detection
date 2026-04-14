@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.conda/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.mplconfig/
+
+# Dataset and generated caches
+archive/data/
+data/nasa_processed/
+data/matrix_data/
+data/**/manifest.json
+
+# Training artifacts
+checkpoints/
+outputs/
+
+# Legacy / accidental local residue
+legacy/
+legacy/original_demo/
+~/
+change.txt
+*.ipynb
+.python-version
+.idea/
